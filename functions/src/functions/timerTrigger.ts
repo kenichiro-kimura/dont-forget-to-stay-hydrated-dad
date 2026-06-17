@@ -3,109 +3,73 @@ import { CosmosClient } from "@azure/cosmos";
 
 type SensorItem = {
   id: string;
-  _ts: number; // Cosmos DB unix seconds
+  _ts: number;
   Body?: {
     median?: number;
-    min?: number;
-    max?: number;
-    average?: number;
-    range?: number;
-    slope?: number;
-    count?: number;
   };
 };
 
 type SensorPoint = {
-  timestamp: number; // ms
+  timestamp: number;
   value: number;
-  raw: SensorItem;
 };
 
-const cosmosClient = new CosmosClient(
-  process.env.COSMOS_DB_CONNECTION_STRING || ""
-);
+type DrinkEvent = {
+  type: "drink" | "refill" | "no_change";
+  mode: "pickup_return" | "adjacent";
+  before: SensorPoint;
+  after: SensorPoint;
+  pickup?: SensorPoint;
+  delta: number; // after.value - before.value
+};
+
+const cosmosClient = new CosmosClient(process.env.COSMOS_DB_CONNECTION_STRING || "");
 
 export async function timerTrigger(
   myTimer: Timer,
   context: InvocationContext
 ): Promise<void> {
   const durationSec = parseInt(process.env.duration || "3600", 10);
-  const threshold = parseInt(process.env.threshold || "5000", 10);
+  const drinkThreshold = parseInt(process.env.threshold || "5000", 10);
+  const pickupDropThreshold = parseInt(process.env.pickupDropThreshold || "30000", 10);
+  const returnLookahead = parseInt(process.env.returnLookahead || "5", 10);
+  const minPoints = parseInt(process.env.minPoints || "3", 10);
 
-  // 水筒を持ち上げた時の大きな落ち込みを除外する閾値
-  // 実測では「飲んだ」が約10000、「持ち上げ」はもっと大きいはずなので調整してね
-  const pickupDropThreshold = parseInt(
-    process.env.pickupDropThreshold || "30000",
-    10
+  const points = await getSensorData(durationSec, context);
+
+  if (points.length < minPoints) {
+    context.log("Not enough sensor data.", { count: points.length });
+    return;
+  }
+
+  const events = detectDrinkEvents(
+    points,
+    pickupDropThreshold,
+    drinkThreshold,
+    returnLookahead,
+    context
   );
 
-  const minValidPoints = parseInt(process.env.minValidPoints || "3", 10);
+  const hasDrink = events.some((e) => e.type === "drink");
 
-  context.log("Timer function processed request.");
-  context.log({
-    durationSec,
-    threshold,
-    pickupDropThreshold,
-    minValidPoints,
+  context.log("Drink judgement", {
+    points: points.length,
+    events: events.length,
+    hasDrink,
+    events,
   });
 
-  const data = await getSensorData(durationSec, context);
-
-  if (data.length === 0) {
-    context.log("No sensor data found.");
+  if (hasDrink) {
+    context.log("OK: drink event detected.");
     return;
   }
 
-  const filtered = removePickupPoints(data, pickupDropThreshold, context);
-
-  if (filtered.length < minValidPoints) {
-    context.log("Not enough valid points after filtering pickup points.", {
-      originalCount: data.length,
-      filteredCount: filtered.length,
-    });
-    return;
-  }
-
-  const values = filtered.map((d) => d.value);
-  const minValue = Math.min(...values);
-  const maxValue = Math.max(...values);
-  const valueRange = maxValue - minValue;
-
-  const firstValue = filtered[0].value;
-  const lastValue = filtered[filtered.length - 1].value;
-  const valueChange = lastValue - firstValue;
-
-  context.log("Judgement result", {
-    originalCount: data.length,
-    filteredCount: filtered.length,
-    firstValue,
-    lastValue,
-    minValue,
-    maxValue,
-    valueRange,
-    valueChange,
-  });
-
-  // 減った/増えたが閾値を超えていればOK
-  // 増えた場合は補充や置き直しとしてOK扱い
-  if (valueRange > threshold) {
-    context.log("OK: value changed enough.");
-    return;
-  }
-
-  context.log("NG: value did not change enough.");
   await sendAlert({
     durationSec,
-    threshold,
+    drinkThreshold,
     pickupDropThreshold,
-    originalCount: data.length,
-    filteredCount: filtered.length,
-    firstValue,
-    lastValue,
-    minValue,
-    maxValue,
-    valueRange,
-    valueChange,
+    points: points.length,
+    events: events.length,
   });
 }
 
@@ -119,9 +83,7 @@ async function getSensorData(
   context: InvocationContext
 ): Promise<SensorPoint[]> {
   const database = cosmosClient.database(process.env.COSMOS_DB_NAME || "");
-  const container = database.container(
-    process.env.COSMOS_DB_CONTAINER_NAME || ""
-  );
+  const container = database.container(process.env.COSMOS_DB_CONTAINER_NAME || "");
 
   const fromUnixSec = Math.floor(Date.now() / 1000) - durationSec;
 
@@ -133,12 +95,7 @@ async function getSensorData(
         AND IS_DEFINED(c.Body.median)
       ORDER BY c._ts ASC
     `,
-    parameters: [
-      {
-        name: "@fromUnixSec",
-        value: fromUnixSec,
-      },
-    ],
+    parameters: [{ name: "@fromUnixSec", value: fromUnixSec }],
   };
 
   const { resources } = await container.items
@@ -150,63 +107,150 @@ async function getSensorData(
     .map((item) => ({
       timestamp: item._ts * 1000,
       value: item.Body!.median!,
-      raw: item,
     }));
 
   context.log(`Fetched ${points.length} sensor points.`);
-
   return points;
 }
 
-function removePickupPoints(
+function detectDrinkEvents(
   points: SensorPoint[],
   pickupDropThreshold: number,
+  drinkThreshold: number,
+  returnLookahead: number,
   context: InvocationContext
-): SensorPoint[] {
-  if (points.length === 0) {
-    return [];
-  }
+): DrinkEvent[] {
+  const events: DrinkEvent[] = [];
+  const consumedIndexes = new Set<number>();
 
-  const values = points.map((p) => p.value);
+  // 1. pickup -> return を優先して見る
+  for (let i = 1; i < points.length - 1; i++) {
+    const before = points[i - 1];
+    const pickup = points[i];
+    const drop = before.value - pickup.value;
 
-  // 水筒を持ち上げた値は大きく下がるので、
-  // 全体の上位側中央値を「水筒が置かれている状態の基準値」とみなす。
-  const baseline = upperHalfMedian(values);
-
-  const filtered = points.filter((p) => {
-    const dropFromBaseline = baseline - p.value;
-
-    if (dropFromBaseline > pickupDropThreshold) {
-      context.log("Removed pickup/dropout point", {
-        timestamp: p.timestamp,
-        value: p.value,
-        baseline,
-        dropFromBaseline,
-      });
-      return false;
+    if (drop < pickupDropThreshold) {
+      continue;
     }
 
-    return true;
-  });
+    const returnResult = findReturnPoint(
+      points,
+      i + 1,
+      before.value,
+      pickupDropThreshold,
+      returnLookahead
+    );
 
-  return filtered;
-}
+    if (!returnResult) {
+      context.log("Pickup detected, but return point was not found.", {
+        before,
+        pickup,
+        drop,
+      });
+      continue;
+    }
 
-function upperHalfMedian(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const upperHalf = sorted.slice(Math.floor(sorted.length / 2));
-  return median(upperHalf);
-}
+    const { point: after, index: afterIndex } = returnResult;
+    const delta = after.value - before.value;
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
+    const event = classifyEvent({
+      mode: "pickup_return",
+      before,
+      pickup,
+      after,
+      delta,
+      drinkThreshold,
+    });
 
-  if (sorted.length % 2 === 0) {
-    return Math.floor((sorted[mid - 1] + sorted[mid]) / 2);
+    events.push(event);
+
+    // pickup周辺を隣接判定で二重検出しないようにする
+    consumedIndexes.add(i - 1);
+    consumedIndexes.add(i);
+    consumedIndexes.add(afterIndex);
+
+    context.log("Detected pickup-return event", event);
   }
 
-  return sorted[mid];
+  // 2. pickup が取れていないケース用に、隣接値の減少/増加も見る
+  for (let i = 1; i < points.length; i++) {
+    if (consumedIndexes.has(i - 1) || consumedIndexes.has(i)) {
+      continue;
+    }
+
+    const before = points[i - 1];
+    const after = points[i];
+    const delta = after.value - before.value;
+
+    if (Math.abs(delta) < drinkThreshold) {
+      continue;
+    }
+
+    const event = classifyEvent({
+      mode: "adjacent",
+      before,
+      after,
+      delta,
+      drinkThreshold,
+    });
+
+    events.push(event);
+    context.log("Detected adjacent event", event);
+  }
+
+  return events;
+}
+
+function findReturnPoint(
+  points: SensorPoint[],
+  startIndex: number,
+  beforeValue: number,
+  pickupDropThreshold: number,
+  returnLookahead: number
+): { point: SensorPoint; index: number } | null {
+  const endIndex = Math.min(points.length, startIndex + returnLookahead);
+
+  for (let i = startIndex; i < endIndex; i++) {
+    const candidate = points[i];
+
+    // まだ持ち上げ中の低い値は無視
+    if (beforeValue - candidate.value >= pickupDropThreshold) {
+      continue;
+    }
+
+    return {
+      point: candidate,
+      index: i,
+    };
+  }
+
+  return null;
+}
+
+function classifyEvent(args: {
+  mode: "pickup_return" | "adjacent";
+  before: SensorPoint;
+  after: SensorPoint;
+  delta: number;
+  drinkThreshold: number;
+  pickup?: SensorPoint;
+}): DrinkEvent {
+  let type: DrinkEvent["type"] = "no_change";
+
+  if (args.delta <= -args.drinkThreshold) {
+    type = "drink";
+  } else if (args.delta >= args.drinkThreshold) {
+    type = "refill";
+  }
+
+  return {
+    type,
+    mode: args.mode,
+    before: args.before,
+    pickup: args.pickup,
+    after: args.after,
+    delta: args.delta,
+  };
 }
 
 async function sendAlert(details: Record<string, unknown>): Promise<void> {
@@ -220,10 +264,10 @@ async function sendAlert(details: Record<string, unknown>): Promise<void> {
   const message = {
     content:
       "💧 パパ、ちゃんと水分とってね\n" +
-      "しばらく水筒の重さがあまり変わっていないみたいです。",
+      "しばらく水筒の重さが減っていないみたいです。",
     embeds: [
       {
-        title: "Sensor judgement details",
+        title: "Judgement details",
         color: 0x3498db,
         fields: Object.entries(details).map(([name, value]) => ({
           name,
@@ -234,14 +278,9 @@ async function sendAlert(details: Record<string, unknown>): Promise<void> {
     ],
   };
 
-  const fetchFn =
-    globalThis.fetch ?? (await import("node-fetch")).default;
-
-  await fetchFn(webhookUrl, {
+  await fetch(webhookUrl, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(message),
   });
 }
