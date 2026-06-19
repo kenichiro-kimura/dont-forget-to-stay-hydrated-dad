@@ -14,6 +14,11 @@ type SensorPoint = {
   value: number;
 };
 
+enum AlertStatus {
+   OK = "OK",
+   ALERT_SENT = "ALERT_SENT"
+}
+
 type DrinkEvent = {
   type: "drink" | "refill" | "no_change";
   mode: "pickup_return" | "adjacent";
@@ -24,21 +29,28 @@ type DrinkEvent = {
 };
 
 const cosmosClient = new CosmosClient(process.env.COSMOS_DB_CONNECTION_STRING || "");
+const database = cosmosClient.database(process.env.COSMOS_DB_NAME || "");
+const container = database.container(process.env.COSMOS_DB_CONTAINER_NAME || "");
+const webhookUrl = process.env.DISCORD_WEBHOOK_URL || "";
+const durationSec = parseInt(process.env.duration || "3600", 10);
+const drinkThreshold = parseInt(process.env.threshold || "5000", 10);
+const pickupDropThreshold = parseInt(process.env.pickupDropThreshold || "30000", 10);
+const returnLookahead = parseInt(process.env.returnLookahead || "5", 10);
+const minPoints = parseInt(process.env.minPoints || "3", 10);
+const cooldownSeconds = parseInt(process.env.ALERT_COOLDOWN_SECONDS || "60", 10);
+const okImageUrl = process.env.OK_IMAGE_URL || "";
+const ngImageUrl = process.env.NG_IMAGE_URL || "";
 
 export async function timerTrigger(
   myTimer: Timer,
   context: InvocationContext
 ): Promise<void> {
-  const durationSec = parseInt(process.env.duration || "3600", 10);
-  const drinkThreshold = parseInt(process.env.threshold || "5000", 10);
-  const pickupDropThreshold = parseInt(process.env.pickupDropThreshold || "30000", 10);
-  const returnLookahead = parseInt(process.env.returnLookahead || "5", 10);
-  const minPoints = parseInt(process.env.minPoints || "3", 10);
 
   const points = await getSensorData(durationSec, context);
 
   if (points.length < minPoints) {
     context.log("Not enough sensor data.", { count: points.length });
+    context.log(points);
     return;
   }
 
@@ -53,24 +65,65 @@ export async function timerTrigger(
   const hasDrink = events.some((e) => e.type === "drink");
 
   context.log("Drink judgement", {
-    points: points.length,
-    events: events.length,
-    hasDrink,
-    events,
+    points: points,
+    events: JSON.stringify(events),
+    hasDrink
   });
 
   if (hasDrink) {
     context.log("OK: drink event detected.");
-    return;
-  }
+    const control = await getControl();
 
-  await sendAlert({
-    durationSec,
-    drinkThreshold,
-    pickupDropThreshold,
-    points: points.length,
-    events: events.length,
-  });
+    if (control?.lastStatus !== AlertStatus.OK || (await canSendAlert())) {
+      await sendAlert(
+        "水筒の重さが減っています。",
+        {
+          title: "娘ちゃんからひとこと",
+          description: "パパ、その調子で水分とってね！",
+          color: 0x3498db,
+          image: {
+            url: okImageUrl,
+          },
+        },
+        {
+        durationSec,
+        drinkThreshold,
+        pickupDropThreshold,
+        points: points.length,
+        events: events.length,
+      });
+      await updateLastAlert(AlertStatus.OK);
+    } else {
+      context.log(
+        "OK alert skipped because last status was OK and cooldown is active."
+      );
+    }
+  } else {
+    if (await canSendAlert()) {
+      await sendAlert(
+        "しばらく水筒の重さが減っていないようです。",
+        {
+          title: "娘ちゃんからひとこと",
+          description: "パパ、ちゃんと水分とってね！",
+          color: 0x3498db,
+          image: {
+            url: ngImageUrl,
+          },
+        },
+        {
+        durationSec,
+        drinkThreshold,
+        pickupDropThreshold,
+        points: points.length,
+        events: events.length,
+      });
+      await updateLastAlert(AlertStatus.ALERT_SENT);
+    } else {
+      context.log(
+        "Alert skipped because cooldown is active."
+      );
+    } 
+  } 
 }
 
 app.timer("timerTrigger", {
@@ -82,10 +135,9 @@ async function getSensorData(
   durationSec: number,
   context: InvocationContext
 ): Promise<SensorPoint[]> {
-  const database = cosmosClient.database(process.env.COSMOS_DB_NAME || "");
-  const container = database.container(process.env.COSMOS_DB_CONTAINER_NAME || "");
 
   const fromUnixSec = Math.floor(Date.now() / 1000) - durationSec;
+  context.log(`Calculating fromUnixSec with current time: ${Math.floor(Date.now() / 1000)}, durationSec: ${durationSec}`);
 
   const querySpec = {
     query: `
@@ -253,19 +305,56 @@ function classifyEvent(args: {
   };
 }
 
-async function sendAlert(details: Record<string, unknown>): Promise<void> {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL || "";
+async function getControl() {
+    try {
+        const { resource } =
+            await container
+                .item("control", "control")
+                .read();
 
+        return resource;
+    }
+    catch {
+        return null;
+    }
+}
+
+async function updateLastAlert(status: AlertStatus) {
+    const doc = {
+        id: "control",
+        partitionKey: "control",
+        lastAlertAt: new Date().toISOString(),
+        lastStatus: status
+    };
+
+    await container.items.upsert(doc);
+}
+
+async function canSendAlert(): Promise<boolean> {
+    const control = await getControl();
+    const now = Date.now();
+
+    const lastAlert =
+        control?.lastAlertAt
+            ? new Date(control.lastAlertAt).getTime()
+            : 0;
+
+    return (
+        now - lastAlert >
+        cooldownSeconds * 1000
+    );
+}
+
+async function sendAlert(content: string, imageContent: { title: string; description: string, color: number, image: { url: string }}, details: Record<string, unknown>): Promise<void> {
   if (!webhookUrl) {
     console.log("DISCORD_WEBHOOK_URL is not set.");
     return;
   }
 
   const message = {
-    content:
-      "💧 パパ、ちゃんと水分とってね\n" +
-      "しばらく水筒の重さが減っていないみたいです。",
+    content: content,
     embeds: [
+      imageContent,
       {
         title: "Judgement details",
         color: 0x3498db,
