@@ -38,6 +38,8 @@ const pickupDropThreshold = parseInt(process.env.pickupDropThreshold || "30000",
 const returnLookahead = parseInt(process.env.returnLookahead || "5", 10);
 const minPoints = parseInt(process.env.minPoints || "3", 10);
 const cooldownSeconds = parseInt(process.env.ALERT_COOLDOWN_SECONDS || "60", 10);
+const maxAdjacentGapSec = parseInt(process.env.maxAdjacentGapSec || "120", 10);
+const refillGraceSec = parseInt(process.env.refillGraceSec || "3600", 10);
 const okImageUrl = process.env.OK_IMAGE_URL || "";
 const ngImageUrl = process.env.NG_IMAGE_URL || "";
 
@@ -62,7 +64,17 @@ export async function timerTrigger(
     context
   );
 
-  const hasDrink = events.some((e) => e.type === "drink");
+  const drinkEvents = events.filter((e) => e.type === "drink");
+  const refillEvents = events.filter((e) => e.type === "refill");
+
+  const latestDrinkAt = Math.max(...drinkEvents.map((e) => e.after.timestamp), 0);
+  const latestRefillAt = Math.max(...refillEvents.map((e) => e.after.timestamp), 0);
+
+  const hasDrinkAfterLatestRefill = latestDrinkAt > latestRefillAt;
+
+  const now = Date.now();
+
+  const hasDrink = hasDrinkAfterLatestRefill || (latestDrinkAt > 0 && latestRefillAt === 0);
 
   context.log("Drink judgement", {
     points: points,
@@ -98,6 +110,12 @@ export async function timerTrigger(
         "OK alert skipped because last status was OK and cooldown is active."
       );
     }
+  } else if (latestRefillAt > 0 && now - latestRefillAt < refillGraceSec * 1000) {
+    context.log("Refill detected recently. Skip alert during grace period.", {
+      latestRefillAt,
+      refillGraceSec,
+    });
+    return;      
   } else {
     if (await canSendAlert()) {
       await sendAlert(
@@ -127,7 +145,7 @@ export async function timerTrigger(
 }
 
 app.timer("timerTrigger", {
-  schedule: "*/10 * * * * *",
+  schedule: "0 * * * * *",
   handler: timerTrigger,
 });
 
@@ -163,6 +181,10 @@ async function getSensorData(
 
   context.log(`Fetched ${points.length} sensor points.`);
   return points;
+}
+
+function secondsBetween(a: SensorPoint, b: SensorPoint): number {
+  return Math.abs(b.timestamp - a.timestamp) / 1000;
 }
 
 function detectDrinkEvents(
@@ -232,6 +254,11 @@ function detectDrinkEvents(
 
     const before = points[i - 1];
     const after = points[i];
+
+    if (secondsBetween(before, after) > maxAdjacentGapSec) {
+      continue;
+    }    
+
     const delta = after.value - before.value;
 
     if (Math.abs(delta) < drinkThreshold) {
