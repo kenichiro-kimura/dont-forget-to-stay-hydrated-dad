@@ -7,7 +7,7 @@ import json
 
 MQTT_HOST = "beam.soracom.io"
 
-SEND_INTERVAL = 30
+SEND_INTERVAL = 5
 READ_INTERVAL_MS = 500
 WINDOW_SEC = 5
 
@@ -112,7 +112,7 @@ def mqtt_publish(client, topic, payload, retries=3):
 
     for i in range(retries):
         try:
-            client.publish(topic, body, qos=1)
+            client.publish(topic, body, qos=0)
             print("published:", body)
             return True
         except Exception as e:
@@ -130,78 +130,3 @@ def mqtt_publish(client, topic, payload, retries=3):
 
     print("mqtt publish skipped")
     return False
-
-
-def mqtt_ensure_alive(client):
-    try:
-        client.ping()
-        # PINGRESP / その他受信メッセージを処理
-        client.check_msg()
-        return True
-    except Exception as e:
-        print("ping/check failed:", e)
-        try:
-            client.disconnect()
-        except:
-            pass
-        try:
-            mqtt_connect(client)
-            return True
-        except Exception as e2:
-            print("reconnect failed:", e2)
-            return False
-
-    return True
-
-try:
-    reset_hx711()
-
-    started_at = time.ticks_ms()
-    while not modem.isconnected():
-        if time.ticks_diff(time.ticks_ms(), started_at) > 60000:
-            raise RuntimeError("modem connection timeout")
-        print("connecting...")
-        time.sleep(1)
-
-    print("connected:", modem.isconnected())
-    print("ifconfig:", modem.ifconfig())
-
-    response = requests.get("http://metadata.soracom.io/v1/subscriber")
-    metadata = json.loads(response.text)
-    response.close()
-
-    device_imsi = metadata["imsi"]
-    client_id = f"myDevice-{device_imsi}"
-
-    # content type / encoding を明示
-    topic = f"devices/{client_id}/messages/events/$.ct=application%2Fjson&$.ce=utf-8"
-
-    client = MQTTClient(
-        client_id=client_id,
-        server=MQTT_HOST,
-        port=1883,
-        keepalive=60
-    )
-
-    mqtt_connect(client)
-
-    while True:
-        samples = collect_window()
-
-        if not samples:
-            print("no samples")
-            time.sleep(SEND_INTERVAL)
-            continue
-
-        payload = summarize(samples)
-        mqtt_ensure_alive(client)
-        mqtt_publish(client, topic, payload)
-
-        time.sleep(SEND_INTERVAL)
-
-finally:
-    try:
-        client.disconnect()
-    except:
-        pass
-    modem.disconnect()
