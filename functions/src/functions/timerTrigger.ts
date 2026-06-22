@@ -82,9 +82,9 @@ export async function timerTrigger(
     hasDrink
   });
 
+  const control = await getControl();
   if (hasDrink) {
     context.log("OK: drink event detected.");
-    const control = await getControl();
 
     if (control?.lastStatus !== AlertStatus.OK || (await canSendAlert())) {
       await sendAlert(
@@ -117,7 +117,7 @@ export async function timerTrigger(
     });
     return;      
   } else {
-    if (await canSendAlert()) {
+    if (control?.lastStatus !== AlertStatus.ALERT_SENT || (await canSendAlert())) {
       await sendAlert(
         "しばらく水筒の重さが減っていないようです。",
         {
