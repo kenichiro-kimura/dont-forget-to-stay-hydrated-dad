@@ -3,12 +3,13 @@ import { container as diContainer } from 'tsyringe';
 import { app, InvocationContext, Timer } from "@azure/functions";
 import { CosmosClient } from "@azure/cosmos";
 import { SensorPoint } from "../domain/SensorPoint";
-import { DrinkEvent } from "../domain/DrinkEvent";
 import { DrinkDetector } from "../domain/DrinkDetector";
 import { INotifiler } from "../interfaces/INotifiler";
 import { DiscordNotifier } from "../infrastructure/discord/DiscordNotifier";
-import { Control, IControlRepository } from "../interfaces/IControlRepository";
+import { IControlRepository } from "../interfaces/IControlRepository";
 import { CosmosControlRepository } from "../infrastructure/cosmos/CosmosControlRepository";
+import { ISensorRepository } from "../interfaces/ISensorRepository";
+import { CosmosSensorRepository } from "../infrastructure/cosmos/CosmosSensorRepository";
 
 type SensorItem = {
   id: string;
@@ -41,16 +42,18 @@ const drinkDetector = new DrinkDetector(maxAdjacentGapSec);
 
 diContainer.registerInstance<INotifiler>("INotifiler", new DiscordNotifier(webhookUrl) );
 diContainer.registerInstance<IControlRepository>("IControlRepository", new CosmosControlRepository(cosmosClient, process.env.COSMOS_DB_NAME || "", process.env.COSMOS_DB_CONTAINER_NAME || ""));
+diContainer.registerInstance<ISensorRepository>("ICosmosSensorRepository", new CosmosSensorRepository(cosmosClient, process.env.COSMOS_DB_NAME || "", process.env.COSMOS_DB_CONTAINER_NAME || ""));
 
 const notifier: INotifiler = diContainer.resolve("INotifiler");
 const controlRepository: IControlRepository = diContainer.resolve("IControlRepository");
+const sensorRepository: ISensorRepository = diContainer.resolve("ICosmosSensorRepository");
 
 export async function timerTrigger(
   myTimer: Timer,
   context: InvocationContext
 ): Promise<void> {
 
-  const points = await getSensorData(durationSec, context);
+  const points = await sensorRepository.getSensorData(durationSec);
 
   if (points.length < minPoints) {
     context.log("Not enough sensor data.", { count: points.length });
@@ -147,41 +150,6 @@ app.timer("timerTrigger", {
   schedule: "0 * * * * *",
   handler: timerTrigger,
 });
-
-async function getSensorData(
-  durationSec: number,
-  context: InvocationContext
-): Promise<SensorPoint[]> {
-
-  //const fromUnixSec = Math.floor(Date.now() / 1000) - durationSec;
-  const fromUnixSec = 1782117600;
-  context.log(`Calculating fromUnixSec with current time: ${Math.floor(Date.now() / 1000)}, durationSec: ${durationSec}`);
-
-  const querySpec = {
-    query: `
-      SELECT c.id, c._ts, c.Body
-      FROM c
-      WHERE c._ts >= @fromUnixSec
-        AND IS_DEFINED(c.Body.median)
-      ORDER BY c._ts ASC
-    `,
-    parameters: [{ name: "@fromUnixSec", value: fromUnixSec }],
-  };
-
-  const { resources } = await container.items
-    .query<SensorItem>(querySpec)
-    .fetchAll();
-
-  const points = resources
-    .filter((item) => typeof item.Body?.median === "number")
-    .map((item) => ({
-      timestamp: item._ts * 1000,
-      value: item.Body!.median!,
-    }));
-
-  context.log(`Fetched ${points.length} sensor points.`);
-  return points;
-}
 
 async function canSendAlert(): Promise<boolean> {
     const control = await controlRepository.get();
