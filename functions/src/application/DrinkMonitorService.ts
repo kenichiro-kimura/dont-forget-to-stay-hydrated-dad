@@ -2,6 +2,7 @@ import { ISensorRepository } from "../interfaces/ISensorRepository";
 import { IControlRepository } from "../interfaces/IControlRepository";
 import { INotifiler } from "../interfaces/INotifiler";
 import { DrinkDetector } from "../domain/DrinkDetector";
+import { DrinkStatusJudge, DrinkStatus } from "../domain/DrinkStatusJudge";
 
 enum AlertStatus {
   Healthy = "Healthy",
@@ -26,7 +27,8 @@ class DrinkMonitorService {
   private controlRepository: IControlRepository;
   private notifier: INotifiler;
   private detector: DrinkDetector;
-
+  private judge: DrinkStatusJudge;
+ 
   constructor(
     sensorRepository: ISensorRepository,
     controlRepository: IControlRepository,
@@ -39,6 +41,7 @@ class DrinkMonitorService {
       this.notifier = notifier;
       this.detector = detector;
       this.drinkMonitorConfig = drinkMonitorConfig;
+      this.judge = new DrinkStatusJudge(drinkMonitorConfig.refillGraceSec);
   }
 
   async execute(): Promise<void> {
@@ -57,28 +60,18 @@ class DrinkMonitorService {
       this.drinkMonitorConfig.returnLookahead
     );
 
-    const drinkEvents = events.filter((e) => e.type === "drink");
-    const refillEvents = events.filter((e) => e.type === "refill");
-
-    const latestDrinkAt = Math.max(...drinkEvents.map((e) => e.after.timestamp), 0);
-    const latestRefillAt = Math.max(...refillEvents.map((e) => e.after.timestamp), 0);
-
-    const hasDrinkAfterLatestRefill = latestDrinkAt > latestRefillAt;
-
-    const now = Date.now();
-
-    const hasDrink = hasDrinkAfterLatestRefill || (latestDrinkAt > 0 && latestRefillAt === 0);
+    const drinkStatus = this.judge.judge(events);
 
     console.log("Drink judgement", {
         points: points,
         events: JSON.stringify(events),
-        hasDrink
+        drinkStatus
     });
 
     const control = await this.controlRepository.get();
-    if (hasDrink) {
+    switch (drinkStatus) {
+      case DrinkStatus.Healthy:
         console.log("Healthy: drink event detected.");
-
         if (control?.lastStatus !== AlertStatus.Healthy || (await this.canSendAlert())) {
             await this.notifier.send({
                 level: "ok",
@@ -103,36 +96,35 @@ class DrinkMonitorService {
               "Healthy alert skipped because last status was Healthy and cooldown is active."
           );
         }
-    } else if (latestRefillAt > 0 && now - latestRefillAt < this.drinkMonitorConfig.refillGraceSec * 1000) {
-      console.log("Refill detected recently. Skip alert during grace period.", {
-        latestRefillAt,
-        refillGraceSec: this.drinkMonitorConfig.refillGraceSec,
-      });
-      return;      
-    } else {
-      if (control?.lastStatus !== AlertStatus.Alerting || (await this.canSendAlert())) {
-        await this.notifier.send({
-          level: "alert",
-          content: "しばらく水筒の重さが減っていないようです。",
-          title: "娘ちゃんからひとこと",
-          description: "パパ、ちゃんと水分とってね！",
-          imageUrl: this.drinkMonitorConfig.ngImageUrl,
-          details: {
-            drinkThreshold: this.drinkMonitorConfig.drinkThreshold,
-            pickupDropThreshold: this.drinkMonitorConfig.pickupDropThreshold,
-            points: points.length,
-            events: events.length
-          }
-        });
-        await this.controlRepository.update({
-          lastStatus: AlertStatus.Alerting,
-          lastAlertAt: new Date().toISOString()
-        });
-      } else {
-        console.log(
-          "Alert skipped because cooldown is active."
-        );
-      } 
+        break;
+      case DrinkStatus.RefillGrace:
+        console.log("Refill detected recently. Skip alert during grace period.");
+        break;
+      case DrinkStatus.Alerting:
+        if (control?.lastStatus !== AlertStatus.Alerting || (await this.canSendAlert())) {
+          await this.notifier.send({
+            level: "alert",
+            content: "しばらく水筒の重さが減っていないようです。",
+            title: "娘ちゃんからひとこと",
+            description: "パパ、ちゃんと水分とってね！",
+            imageUrl: this.drinkMonitorConfig.ngImageUrl,
+            details: {
+              drinkThreshold: this.drinkMonitorConfig.drinkThreshold,
+              pickupDropThreshold: this.drinkMonitorConfig.pickupDropThreshold,
+              points: points.length,
+              events: events.length
+            }
+          });
+          await this.controlRepository.update({
+            lastStatus: AlertStatus.Alerting,
+            lastAlertAt: new Date().toISOString()
+          });
+        } else {
+          console.log(
+            "Alert skipped because cooldown is active."
+          );
+        } 
+        break;
     }
   }
 
